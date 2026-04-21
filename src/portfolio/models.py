@@ -51,6 +51,33 @@ class TradeStatus(str, Enum):
 # DTOs
 # ---------------------------------------------------------------------------
 
+class Quote(BaseModel):
+    """Market price snapshot for a trading pair.
+
+    Attributes:
+        symbol: Trading pair (e.g. ``"EUR/USD"``).
+        price: Mid-market price.
+        bid: Bid price.
+        ask: Ask price.
+        timestamp: Quote timestamp (UTC).
+        volume: Reported trading volume (optional).
+    """
+
+    symbol: str
+    price: float
+    bid: float
+    ask: float
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    volume: float = 0.0
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    @property
+    def spread_pips(self) -> float:
+        """Spread in pips."""
+        return self.ask - self.bid
+
+
 class Position(BaseModel):
     """A currently open trading position.
 

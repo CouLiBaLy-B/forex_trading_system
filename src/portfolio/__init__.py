@@ -7,6 +7,7 @@ Exports:
       ``PerformanceMetrics``, ``PositionSummary``, ``AggregatedPosition``,
       ``RollingMetrics``.
     * Enums: ``OrderSide``, ``PositionSide``, ``OrderType``, ``TradeStatus``.
+    * ``Quote`` – market price snapshot with spread calculation.
 """
 
 from .manager import PortfolioManager
@@ -19,6 +20,7 @@ from .models import (
     Position,
     PositionSide,
     PositionSummary,
+    Quote,
     RollingMetrics,
     TradeRecord,
     TradeStatus,
@@ -36,6 +38,7 @@ __all__ = [
     "Position",
     "PositionSide",
     "PositionSummary",
+    "Quote",
     "RollingMetrics",
     "TradeRecord",
     "TradeStatus",
