@@ -1,0 +1,47 @@
+risk_management:
+  mode: "conservative"
+  max_position_size_pct: 2.0
+  max_total_exposure_pct: 10.0
+  max_drawdown_pct: 15.0
+  daily_loss_limit_pct: 5.0
+  max_correlated_positions: 3
+  max_positions_per_pair: 1
+  max_open_orders: 20
+
+  position_sizing:
+    method: "kelly_fraction"
+    kelly_fraction: 0.25
+    max_risk_per_trade_pct: 1.0
+    min_trade_size: 1000
+    lot_step: 0.01
+
+  risk_limits:
+    stop_loss_default_pips: 50
+    take_profit_default_pips: 100
+    trailing_stop_pips: 25
+    max_hold_duration_hours: 72
+    max_daily_trades: 20
+    min_between_trades_minutes: 5
+
+  risk_mode_profiles:
+    conservative:
+      max_position_size_pct: 1.0
+      max_total_exposure_pct: 5.0
+      max_drawdown_pct: 10.0
+      daily_loss_limit_pct: 3.0
+      stop_loss_default_pips: 30
+      max_daily_trades: 10
+    moderate:
+      max_position_size_pct: 2.0
+      max_total_exposure_pct: 10.0
+      max_drawdown_pct: 15.0
+      daily_loss_limit_pct: 5.0
+      stop_loss_default_pips: 50
+      max_daily_trades: 20
+    aggressive:
+      max_position_size_pct: 3.0
+      max_total_exposure_pct: 15.0
+      max_drawdown_pct: 20.0
+      daily_loss_limit_pct: 8.0
+      stop_loss_default_pips: 75
+      max_daily_trades: 30
