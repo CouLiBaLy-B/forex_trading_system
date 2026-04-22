@@ -1,13 +1,12 @@
-"""RiskManager – pre-trade validation, dynamic SL/TP, and risk alerts."""
+"""Core risk management for forex trading."""
 
-from __future__ import annotations
+import threading
+from datetime import datetime, timezone
 
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+import numpy as np
 
 from .models import (
     PositionInfo,
-    PreTradeResult,
     RiskAlert,
     RiskLimitExceeded,
     RiskMode,
@@ -15,434 +14,177 @@ from .models import (
     ValidationResult,
 )
 from .position_sizer import PositionSizer
+from ..indicators.base import PriceSeries
 
 
 class RiskManager:
-    """Central risk engine for forex trading.
+    """Central risk management engine."""
 
-    Responsibilities:
-        * **Pre-trade checks** – position size, exposure, correlation,
-          drawdown, daily loss, margin (all return ``Pass`` or ``Fail``).
-        * **Dynamic SL/TP** – ATR-based stop-loss and take-profit.
-        * **Risk alerts** – event-driven alert recording with severity levels.
-
-    All numeric limits are expressed as *fractions* of equity (0-1).
-    """
-
-    def __init__(self, risk_params: Optional[RiskParams] = None) -> None:
-        """Initialise with optional risk configuration.
-
-        Args:
-            risk_params: Risk parameters. Falls back to defaults for
-                moderate mode when omitted.
-        """
-        self.params = risk_params or RiskParams(risk_mode=RiskMode.MODERATE)
-        self._peak_equity: float = 0.0
-        self._daily_start_equity: float = 0.0
+    def __init__(self, params: RiskParams, account_id: str = "default"):
+        self.params = params
+        self.account_id = account_id
+        self.sizer = PositionSizer(params)
+        self._positions: dict[str, PositionInfo] = {}
         self._daily_pnl: float = 0.0
         self._alert_history: list[RiskAlert] = []
-        self._positions: list[PositionInfo] = []
-        self._correlation_matrix: dict[tuple[str, str], float] = {}
+        self._peak_equity: dict[str, float] = {}
+        self._correlation_matrix: dict[str, np.ndarray] = {}
+        self._lock = threading.Lock()
 
-    # ------------------------------------------------------------------
-    #  Pre-trade checks  – each returns Pass/Fail with a reason on Fail
-    # ------------------------------------------------------------------
+    # ---- Position management ----
 
-    def check_position_size(
-        self,
-        position_value: float,
-        account_equity: float,
-    ) -> PreTradeResult:
-        """Validate that a single position does not exceed the allowed size.
-
-        Args:
-            position_value: Notional value of the proposed position.
-            account_equity: Current account equity.
-
-        Returns:
-            PreTradeResult with passed flag and check name on failure.
-        """
-        effective_limit = self.params.position_size
-        ratio = position_value / account_equity if account_equity > 0 else 0.0
-
-        if ratio > effective_limit:
-            reason = (
-                f"position_size: {ratio:.4f} exceeds limit {effective_limit:.4f}"
+    def open_position(self, symbol: str, side: str, price: float, quantity: float,
+                     stop_loss: float | None = None, take_profit: float | None = None,
+                     current_equity: float | None = None) -> PositionInfo:
+        with self._lock:
+            position = PositionInfo(
+                symbol=symbol, side=side, entry_price=price,
+                quantity=quantity, stop_loss=stop_loss, take_profit=take_profit,
             )
-            return PreTradeResult(passed=False, checks=[reason])
-        return PreTradeResult(passed=True)
+            self._positions[symbol] = position
+            equity = self._get_equity(current_equity, price, quantity)
+            self._update_peak_equity(equity)
+            return position
 
-    def check_exposure(
-        self,
-        proposed_position_value: float,
-        account_equity: float,
-    ) -> PreTradeResult:
-        """Validate total portfolio exposure stays within limits.
+    def _get_equity(self, current_equity: float | None, price: float, quantity: float) -> float:
+        if current_equity is not None:
+            return current_equity
+        notional = abs(price * quantity)
+        return notional  # fallback to notional if equity unknown
 
-        Args:
-            proposed_position_value: Notional of the *new* position.
-            account_equity: Current account equity.
+    def _update_peak_equity(self, current_equity: float) -> None:
+        if current_equity > self._peak_equity.get(self.account_id, 0):
+            self._peak_equity[self.account_id] = current_equity
 
-        Returns:
-            PreTradeResult with passed flag and check name on failure.
-        """
-        current_exposure = PositionSizer.aggregate_exposure(
-            self._positions, account_equity
-        )
-        new_exposure = (current_exposure * account_equity + proposed_position_value) / account_equity
+    def close_position(self, symbol: str, exit_price: float, current_equity: float | None = None) -> float:
+        with self._lock:
+            position = self._positions.pop(symbol)
+            if position.side == "long":
+                pnl = (exit_price - position.entry_price) * position.quantity
+            else:
+                pnl = (position.entry_price - exit_price) * position.quantity
+            self._daily_pnl += pnl
+            equity = self._get_equity(current_equity, exit_price, 0)
+            self._update_peak_equity(equity)
+            return pnl
 
-        if new_exposure > self.params.max_total_exposure_pct:
-            reason = (
-                f"exposure: {new_exposure:.4f} exceeds limit "
-                f"{self.params.max_total_exposure_pct:.4f}"
-            )
-            return PreTradeResult(passed=False, checks=[reason])
-        return PreTradeResult(passed=True)
+    def get_positions(self) -> dict[str, PositionInfo]:
+        with self._lock:
+            return dict(self._positions)
 
-    def check_correlation(
-        self,
-        new_symbol: str,
-        account_equity: float,
-    ) -> PreTradeResult:
-        """Check correlation between the proposed symbol and existing positions.
+    def _get_position_notional(self, position: PositionInfo) -> float:
+        """Approximate notional value."""
+        return abs(position.entry_price * position.quantity)
 
-        Iterates open positions and looks up the stored correlation coefficient.
-        If any correlation exceeds ``max_correlation``, the check fails.
+    # ---- Pre-trade checks ----
 
-        Args:
-            new_symbol: Symbol of the proposed trade.
-            account_equity: Current account equity.
+    def check_position_size(self, symbol: str, price: float, quantity: float,
+                            current_equity: float) -> bool:
+        """Check if position value / equity is within limits."""
+        if current_equity <= 0:
+            return False
+        max_size = self.params.position_size * current_equity
+        position_value = abs(price * quantity)
+        return position_value <= max_size
 
-        Returns:
-            PreTradeResult with passed flag and check name on failure.
-        """
-        for pos in self._positions:
-            corr = self._correlation_matrix.get(
-                tuple(sorted((pos.symbol, new_symbol))), 0.0
-            )
-            if corr > self.params.max_correlation:
-                reason = (
-                    f"correlation({pos.symbol},{new_symbol}): "
-                    f"{corr:.4f} exceeds max {self.params.max_correlation:.4f}"
-                )
-                return PreTradeResult(passed=False, checks=[reason])
-        return PreTradeResult(passed=True)
+    def check_exposure(self, symbol: str, price: float, quantity: float,
+                       current_equity: float) -> bool:
+        """Check total portfolio exposure (notional) vs equity."""
+        with self._lock:
+            notional = current_equity + abs(price * quantity)
+            for pos in self._positions.values():
+                notional += self._get_position_notional(pos)
+            return notional / current_equity <= (1 + self.params.max_total_exposure_pct)
 
-    def check_drawdown(self, current_equity: float) -> PreTradeResult:
-        """Validate current drawdown from peak equity.
+    def check_correlation(self, symbol: str) -> float:
+        """Get max pairwise correlation of new position with existing positions."""
+        if not self._correlation_matrix:
+            return 0.0
+        max_corr = 0.0
+        for sym, matrix in self._correlation_matrix.items():
+            if sym in self._positions:
+                max_corr = max(max_corr, abs(matrix[self._positions[sym].symbol]))
+        return max_corr
 
-        Args:
-            current_equity: Current account equity.
+    def check_drawdown(self, current_equity: float) -> bool:
+        """Check drawdown from peak equity."""
+        peak = self._peak_equity.get(self.account_id, 0)
+        if peak == 0:
+            return True
+        drawdown = (peak - current_equity) / peak
+        return drawdown <= self.params.max_drawdown_pct
 
-        Returns:
-            PreTradeResult with passed flag and check name on failure.
-        """
-        if current_equity > self._peak_equity:
-            self._peak_equity = current_equity
+    def check_daily_loss(self, current_equity: float) -> bool:
+        """Check daily P&L loss vs daily loss limit."""
+        if current_equity <= 0:
+            return False
+        return abs(self._daily_pnl) / current_equity <= self.params.max_daily_loss_pct
 
-        if self._peak_equity <= 0:
-            return PreTradeResult(passed=True)
+    def check_margin(self, symbol: str, price: float, quantity: float,
+                     current_equity: float) -> bool:
+        """Check margin requirements."""
+        margin_for_new = abs(price * quantity) * self.params.margin_requirement_pct
+        required = margin_for_new
+        for sym, pos in self._positions.items():
+            required += self._get_position_notional(pos) * self.params.margin_requirement_pct
+        return current_equity >= required
 
-        drawdown = (self._peak_equity - current_equity) / self._peak_equity
+    def pre_trade_check(self, symbol: str, side: str, price: float, quantity: float,
+                        current_equity: float) -> ValidationResult:
+        """Run all pre-trade checks."""
+        try:
+            if not self.check_position_size(symbol, price, quantity, current_equity):
+                raise RiskLimitExceeded("Position size", abs(price * quantity),
+                                        self.params.position_size * current_equity)
+            if not self.check_exposure(symbol, price, quantity, current_equity):
+                raise RiskLimitExceeded("Total exposure", abs(price * quantity) / current_equity,
+                                        self.params.max_total_exposure_pct)
+            if not self.check_drawdown(current_equity):
+                raise RiskLimitExceeded("Drawdown", self._peak_equity.get(self.account_id, 0) / current_equity,
+                                        1 - self.params.max_drawdown_pct)
+            if not self.check_daily_loss(current_equity):
+                raise RiskLimitExceeded("Daily loss", abs(self._daily_pnl),
+                                        self.params.max_daily_loss_pct * current_equity)
+            if not self.check_margin(symbol, price, quantity, current_equity):
+                raise RiskLimitExceeded("Margin", self._get_position_notional(PositionInfo(symbol=symbol, side=side, entry_price=price, quantity=quantity)) * self.params.margin_requirement_pct,
+                                        current_equity)
+        except RiskLimitExceeded as e:
+            self._record_alert(severity="critical", category="pre_trade",
+                             message=str(e), current_value=e.value, limit=e.limit)
+            return ValidationResult.FAIL
+        return ValidationResult.PASS
 
-        if drawdown > self.params.max_drawdown_pct:
-            reason = (
-                f"drawdown: {drawdown:.4f} exceeds limit "
-                f"{self.params.max_drawdown_pct:.4f}"
-            )
-            return PreTradeResult(passed=False, checks=[reason])
-        return PreTradeResult(passed=True)
+    # ---- Dynamic SL / TP ----
 
-    def check_daily_loss(self, current_equity: float) -> PreTradeResult:
-        """Validate today's P&L against the daily loss limit.
+    def compute_stop_loss_take_profit(self, prices: PriceSeries, side: str, entry_price: float,
+                                      atr_value: float) -> tuple[float | None, float | None]:
+        """Compute stop / take-profit from ATR."""
+        multiplier = self.params.atr_multiplier
+        if side == "long":
+            return entry_price - multiplier * atr_value, entry_price + multiplier * atr_value * 1.5
+        return entry_price + multiplier * atr_value, entry_price - multiplier * atr_value * 1.5
 
-        Args:
-            current_equity: Current account equity.
+    # ---- Alerts ----
 
-        Returns:
-            PreTradeResult with passed flag and check name on failure.
-        """
-        if self._daily_start_equity <= 0:
-            return PreTradeResult(passed=True)
-
-        daily_loss = (self._daily_start_equity - current_equity) / self._daily_start_equity
-
-        if daily_loss > self.params.max_daily_loss_pct:
-            reason = (
-                f"daily_loss: {daily_loss:.4f} exceeds limit "
-                f"{self.params.max_daily_loss_pct:.4f}"
-            )
-            return PreTradeResult(passed=False, checks=[reason])
-        return PreTradeResult(passed=True)
-
-    def check_margin(
-        self,
-        position_value: float,
-        account_equity: float,
-    ) -> PreTradeResult:
-        """Validate that margin requirement is satisfied.
-
-        Args:
-            position_value: Notional of the proposed position.
-            account_equity: Current account equity.
-
-        Returns:
-            PreTradeResult with passed flag and check name on failure.
-        """
-        required_margin = position_value * self.params.margin_requirement_pct
-
-        if required_margin > account_equity:
-            reason = (
-                f"margin: required {required_margin:.2f} > equity {account_equity:.2f}"
-            )
-            return PreTradeResult(passed=False, checks=[reason])
-        return PreTradeResult(passed=True)
-
-    # ------------------------------------------------------------------
-    #  Full pre-trade validation  – runs every check
-    # ------------------------------------------------------------------
-
-    def pre_trade_check(
-        self,
-        position_value: float,
-        account_equity: float,
-        proposed_symbol: Optional[str] = None,
-    ) -> PreTradeResult:
-        """Run *all* pre-trade checks and return aggregated result.
-
-        Args:
-            position_value: Notional of the proposed position.
-            account_equity: Current account equity.
-            proposed_symbol: Symbol for correlation check (optional).
-
-        Returns:
-            PreTradeResult with passed flag and *all* failure reasons.
-        """
-        all_failures: list[str] = []
-
-        results = [
-            self.check_position_size(position_value, account_equity),
-            self.check_exposure(position_value, account_equity),
-            self.check_drawdown(account_equity),
-            self.check_daily_loss(account_equity),
-            self.check_margin(position_value, account_equity),
-        ]
-
-        if proposed_symbol:
-            results.append(self.check_correlation(proposed_symbol, account_equity))
-
-        for r in results:
-            if not r.passed:
-                all_failures.extend(r.checks)
-
-        return PreTradeResult(passed=not all_failures, checks=all_failures)
-
-    # ------------------------------------------------------------------
-    #  Dynamic stop-loss / take-profit
-    # ------------------------------------------------------------------
-
-    def calc_stop_loss(
-        self,
-        entry_price: float,
-        side: str,
-        atr: float,
-    ) -> float:
-        """Delegate to ``PositionSizer.calc_dynamic_stop_loss``.
-
-        Args:
-            entry_price: Entry price.
-            side: ``"long"`` or ``"short"``.
-            atr: Average True Range.
-
-        Returns:
-            Stop-loss price.
-        """
-        return PositionSizer.calc_dynamic_stop_loss(
-            entry_price, side, atr, self.params.atr_multiplier
-        )
-
-    def calc_take_profit(
-        self,
-        entry_price: float,
-        side: str,
-        atr: float,
-        rr_ratio: float = 2.0,
-    ) -> float:
-        """Delegate to ``PositionSizer.calc_dynamic_take_profit``.
-
-        Args:
-            entry_price: Entry price.
-            side: ``"long"`` or ``"short"``.
-            atr: Average True Range.
-            rr_ratio: Risk-reward ratio (default 2.0).
-
-        Returns:
-            Take-profit price.
-        """
-        return PositionSizer.calc_dynamic_take_profit(
-            entry_price, side, atr, self.params.atr_multiplier, rr_ratio
-        )
-
-    # ------------------------------------------------------------------
-    #  Risk alerts system
-    # ------------------------------------------------------------------
-
-    def emit_alert(
-        self,
-        severity: str,
-        category: str,
-        message: str,
-        current_value: float,
-        threshold: float,
-    ) -> RiskAlert:
-        """Record and return a ``RiskAlert``.
-
-        Args:
-            severity: ``"info"``, ``"warning"``, or ``"critical"``.
-            category: Short category label.
-            message: Human-readable description.
-            current_value: The measured value at alert time.
-            threshold: The threshold that was breached / targeted.
-
-        Returns:
-            The created ``RiskAlert``.
-        """
-        alert = RiskAlert(
-            severity=severity,
-            category=category,
-            message=message,
-            current_value=current_value,
-            threshold=threshold,
-        )
+    def _record_alert(self, severity: str, category: str, message: str,
+                      current_value: float, limit: float) -> RiskAlert:
+        alert = RiskAlert(severity=severity, category=category, message=message,
+                        current_value=current_value, threshold=limit)
         self._alert_history.append(alert)
         return alert
 
-    def get_alerts(
-        self,
-        severity: Optional[str] = None,
-        since: Optional[datetime] = None,
-    ) -> list[RiskAlert]:
-        """Retrieve alerts with optional filters.
+    def get_alerts(self, severity: str | None = None, category: str | None = None) -> list[RiskAlert]:
+        alerts = self._alert_history
+        if severity:
+            alerts = [a for a in alerts if a.severity == severity]
+        if category:
+            alerts = [a for a in alerts if a.category == category]
+        return alerts
 
-        Args:
-            severity: Filter by severity level.
-            since: Filter alerts on or after this timestamp.
-
-        Returns:
-            List of matching ``RiskAlert`` objects.
-        """
-        result = self._alert_history
-        if severity is not None:
-            result = [a for a in result if a.severity == severity]
-        if since is not None:
-            result = [a for a in result if a.timestamp >= since]
-        return result
-
-    # ------------------------------------------------------------------
-    #  Position management
-    # ------------------------------------------------------------------
-
-    def open_position(
-        self,
-        symbol: str,
-        side: str,
-        entry_price: float,
-        quantity: float,
-    ) -> PositionInfo:
-        """Record a new open position and update peak equity.
-
-        Args:
-            symbol: Trading pair.
-            side: ``"long"`` or ``"short"``.
-            entry_price: Entry price.
-            quantity: Lot size.
-
-        Returns:
-            The created ``PositionInfo``.
-        """
-        position = PositionInfo(
-            symbol=symbol,
-            side=side,
-            entry_price=entry_price,
-            quantity=quantity,
-        )
-        self._positions.append(position)
-        self._update_peak_equity()
-        return position
-
-    def close_position(self, symbol: str) -> Optional[PositionInfo]:
-        """Remove an open position by symbol.
-
-        Args:
-            symbol: Trading pair to close.
-
-        Returns:
-            The closed ``PositionInfo``, or ``None`` if not found.
-        """
-        for i, pos in enumerate(self._positions):
-            if pos.symbol == symbol:
-                return self._positions.pop(i)
-        return None
-
-    def set_correlation(
-        self,
-        symbol_a: str,
-        symbol_b: str,
-        correlation: float,
-    ) -> None:
-        """Set the pairwise correlation between two symbols.
-
-        Args:
-            symbol_a: First symbol.
-            symbol_b: Second symbol.
-            correlation: Correlation coefficient (0-1).
-        """
-        key = tuple(sorted((symbol_a, symbol_b)))
-        self._correlation_matrix[key] = correlation
-
-    # ------------------------------------------------------------------
-    #  Daily reset
-    # ------------------------------------------------------------------
-
-    def reset_daily(self, current_equity: float) -> None:
-        """Reset daily P&L tracking at the start of a new trading day.
-
-        Args:
-            current_equity: Equity at reset time (becomes the new daily
-                starting equity).
-        """
-        self._daily_start_equity = current_equity
-        self._daily_pnl = 0.0
-
-    # ------------------------------------------------------------------
-    #  Properties
-    # ------------------------------------------------------------------
-
-    @property
-    def peak_equity(self) -> float:
-        """Current peak equity."""
-        return self._peak_equity
-
-    @property
-    def daily_pnl(self) -> float:
-        """Current daily P&L."""
-        return self._daily_pnl
-
-    @property
-    def open_positions(self) -> list[PositionInfo]:
-        """List of open positions."""
-        return list(self._positions)
-
-    # ------------------------------------------------------------------
-    #  Internal helpers
-    # ------------------------------------------------------------------
-
-    def _update_peak_equity(self) -> None:
-        """Update peak equity if the current equity exceeds the stored peak."""
-        # Use the total notional of open positions as a rough equity proxy
-        # when no explicit current equity is provided.
-        total = sum(
-            abs(pos.quantity * pos.entry_price) for pos in self._positions
-        )
-        if total > self._peak_equity:
-            self._peak_equity = total
+    def filter_alerts(self, min_severity: str, category: str | None = None) -> list[RiskAlert]:
+        severity_order = {"info": 0, "warning": 1, "critical": 2}
+        min_level = severity_order.get(min_severity, 0)
+        alerts = [a for a in self._alert_history if severity_order.get(a.severity, 0) >= min_level]
+        if category:
+            alerts = [a for a in alerts if a.category == category]
+        return alerts

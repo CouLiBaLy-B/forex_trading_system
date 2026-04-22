@@ -2,25 +2,36 @@ import numpy as np
 from .base import TechnicalIndicator, IndicatorResult, PriceSeries
 
 class MACD(TechnicalIndicator):
-    """Moving Average Convergence Divergence - trend-following momentum indicator."""
+    """Moving Average Convergence Divergence."""
 
     def __init__(self, fast_period: int = 12, slow_period: int = 26, signal_period: int = 9):
-        super().__init__("macd", {"fast": fast_period, "slow": slow_period, "signal": signal_period})
+        super().__init__("macd", {
+            "fast_period": fast_period,
+            "slow_period": slow_period,
+            "signal_period": signal_period,
+        })
         self.fast_period = fast_period
         self.slow_period = slow_period
         self.signal_period = signal_period
 
+    def _ema(self, arr: np.ndarray, period: int) -> list[float]:
+        multiplier = 2 / (period + 1)
+        ema = [arr[0]]
+        for i in range(1, len(arr)):
+            ema.append(ema[-1] * (1 - multiplier) + arr[i] * multiplier)
+        return ema
+
     def compute(self, prices: PriceSeries) -> IndicatorResult:
         close = np.array(prices.close())
-        ema_fast = [close[0]]
-        ema_slow = [close[0]]
-        mult_fast = 2 / (self.fast_period + 1)
-        mult_slow = 2 / (self.slow_period + 1)
-        for i in range(1, len(close)):
-            ema_fast.append(ema_fast[-1] * (1 - mult_fast) + close[i] * mult_fast)
-            ema_slow.append(ema_slow[-1] * (1 - mult_slow) + close[i] * mult_slow)
-        macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
-        signal_vals = np.convolve(macd_line, np.ones(self.signal_period)/self.signal_period, mode='valid')
-        histogram = macd_line[self.signal_period:] - signal_vals
-        values = [None] * (self.slow_period + self.signal_period) + list(zip(macd_line[self.slow_period:], signal_vals, histogram))
+        fast_ema = self._ema(close, self.fast_period)
+        slow_ema = self._ema(close, self.slow_period)
+        macd_line = [f - s for f, s in zip(fast_ema, slow_ema)]
+        signal_line = self._ema(np.array(macd_line), self.signal_period)
+        histogram = [m - s for m, s in zip(macd_line, signal_line)]
+
+        pad = max(self.fast_period, self.slow_period, self.signal_period)
+        values = [None] * (pad - 1) + [
+            (macd_line[i], signal_line[i], histogram[i])
+            for i in range(pad - 1, len(close))
+        ]
         return IndicatorResult(name=self.name, values=values, timestamp=[])
